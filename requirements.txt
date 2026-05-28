@@ -1,6 +1,5 @@
 streamlit
-yfinance
 pandas
-matplotlib
 numpy
-re
+yfinance
+edgartools
