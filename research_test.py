@@ -3,6 +3,7 @@ import yfinance as yf
 import pandas as pd
 import re
 import numpy as np
+import edgar as edgar
 from edgar import Company, set_identity
 
 st.set_page_config(page_title="Equity Research Terminal", layout="wide")
