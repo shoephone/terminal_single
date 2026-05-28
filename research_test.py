@@ -1,8 +1,48 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
+import re
+import numpy as np
+from edgar import Company, set_identity
 
 st.set_page_config(page_title="Equity Research Terminal", layout="wide")
+
+# Required by SEC to identify the user
+set_identity("collin.mccoll@gmail.com")
+
+# ==========================================
+# 0. Edgar Data Cleaner
+# ==========================================
+def clean_edgar_statement(statement):
+    """Strips XBRL metadata and formats edgartools statements for financial modeling."""
+    if not statement:
+        return pd.DataFrame()
+        
+    df = statement.to_dataframe()
+    if df.empty:
+        return df
+        
+    # 1. Use human-readable SEC labels for the row index
+    if 'label' in df.columns:
+        df = df.set_index('label')
+    elif 'concept' in df.columns:
+        df = df.set_index('concept')
+        
+    # -> THE FIX: Drop duplicate index labels so df.at[] returns a scalar, not a Series
+    df = df[~df.index.duplicated(keep='first')]
+        
+    # 2. Identify and keep ONLY columns that contain dates
+    date_cols = [col for col in df.columns if isinstance(col, str) and re.search(r'\d{4}-\d{2}-\d{2}', col)]
+    
+    if not date_cols:
+        return pd.DataFrame()
+        
+    clean_df = df[date_cols]
+    
+    # 3. Ensure all extracted data is strictly numeric so the styler's math works
+    clean_df = clean_df.apply(pd.to_numeric, errors='coerce')
+    
+    return clean_df
 
 # ==========================================
 # 1. Ingestion Layer with Caching
@@ -12,11 +52,18 @@ def get_comprehensive_ticker_data(symbol):
     ticker = yf.Ticker(symbol)
     info = ticker.info
     
-    # Safely extract financials to avoid crashing if unavailable
     try:
-        financials = ticker.quarterly_financials
-        balance_sheet = ticker.quarterly_balance_sheet
-        cashflow = ticker.quarterly_cashflow
+        company = Company(symbol)
+        
+        # Extracting the latest 10-K filing
+        filing = company.get_filings(form="10-K").latest()
+        statement_obj = filing.obj()
+        
+        # Apply the cleaner function before passing data downstream
+        financials = clean_edgar_statement(statement_obj.income_statement)
+        balance_sheet = clean_edgar_statement(statement_obj.balance_sheet)
+        cashflow = clean_edgar_statement(statement_obj.cash_flow_statement)
+        
     except Exception:
         financials = balance_sheet = cashflow = pd.DataFrame()
         
@@ -25,18 +72,13 @@ def get_comprehensive_ticker_data(symbol):
 @st.cache_data(ttl=3600)
 def get_indexed_performance(ticker_symbol, benchmark_symbol, period="1y"):
     try:
-        # yf.download with multiple tickers returns a dataframe with tickers as columns
         data = yf.download([ticker_symbol, benchmark_symbol], period=period)['Close']
-        
-        # Forward-fill to handle mismatched trading days (e.g., market halts), then drop early NaNs
         data = data.ffill().dropna()
         
         if data.empty:
             return pd.DataFrame()
             
-        # Indexing Math: (Current Price / Starting Price - 1) * 100
         indexed_data = (data / data.iloc[0] - 1) * 100
-        
         return indexed_data
     except Exception as e:
         return pd.DataFrame()
@@ -46,52 +88,39 @@ def get_indexed_performance(ticker_symbol, benchmark_symbol, period="1y"):
 # 2. DataFrame Styling Helper Function
 # ==========================================
 def style_financial_statements(df):
-    """Formats statements with accounting standards (parentheses for negatives), text arrows (↑/↓), % change, and a row-wise heatmap."""
     if df is None or df.empty:
         return df
         
-    # --- Drop columns that are completely empty (all NaNs) BEFORE formatting ---
     df = df.dropna(axis=1, how='all')
-    
-    # Safeguard: If dropping empty columns leaves us with nothing, return early
     if df.empty:
         return df
     
-    # 1. Ensure columns are sorted newest to oldest (Standard yfinance output)
     cols = sorted(df.columns, reverse=True)
+    numeric_df = df[cols].apply(pd.to_numeric, errors='coerce')
+    numeric_df_filled = numeric_df.fillna(0)
     
-    # 2. Create a purely numeric copy for math/heatmaps (handling NaNs)
-    numeric_df = df[cols].apply(pd.to_numeric, errors='coerce').fillna(0)
-    
-    # Cast display_df to 'object' so Pandas allows us to inject strings (arrows, %, N/A)
     display_df = df[cols].copy().astype(object)
     
-    # --- Strict Accounting Formatter ---
     def to_accounting(val):
-        if pd.isna(val):
-            return "N/A"
-        if val == 0:
-            return "—" # Em-dash for exactly zero
+        if pd.isna(val) or val == 0:
+            return "" 
         if val < 0:
-            return f"({abs(val):,.0f})" # Parentheses for negatives
+            return f"({abs(val):,.0f})" 
         return f"{val:,.0f}"
     
-    # 3. Calculate Deltas, % Change, and Assign Text Arrows
     for i, col in enumerate(cols):
-        if i < len(cols) - 1: # We have a previous period (to the right) to compare against
+        if i < len(cols) - 1:
             prev_col = cols[i+1]
             for idx in numeric_df.index:
                 curr_val = numeric_df.at[idx, col]
                 prev_val = numeric_df.at[idx, prev_col]
                 
-                # Handle missing data points
-                if pd.isna(df.at[idx, col]):
-                    display_df.at[idx, col] = "N/A"
+                if pd.isna(curr_val) or curr_val == 0:
+                    display_df.at[idx, col] = ""
                     continue
                     
                 delta = curr_val - prev_val
                 
-                # Calculate percentage change safely
                 if prev_val != 0 and not pd.isna(prev_val):
                     pct_change = (delta / abs(prev_val)) * 100
                     pct_str = f" ({pct_change:+,.1f}%)" 
@@ -103,57 +132,90 @@ def style_financial_statements(df):
                 elif delta < 0:
                     arrow = f" ↓{pct_str}"
                 else:
-                    arrow = " -"
+                    arrow = "" 
                     
-                # Apply accounting format to the base number, then append the arrow/pct
-                display_df.at[idx, col] = f"{to_accounting(curr_val)}{arrow}"
-        else: # Oldest period (No prior data to compare)
+                display_df.at[idx, col] = f"{to_accounting(curr_val)}{arrow}".strip()
+        else: 
             for idx in numeric_df.index:
                 curr_val = numeric_df.at[idx, col]
-                display_df.at[idx, col] = to_accounting(curr_val)
+                if pd.isna(curr_val) or curr_val == 0:
+                    display_df.at[idx, col] = ""
+                else:
+                    display_df.at[idx, col] = to_accounting(curr_val)
                     
-    # 4. Clean up column headers (Convert Pandas Timestamps to YYYY-MM-DD Strings)
     str_cols = [c.strftime('%Y-%m-%d') if hasattr(c, 'strftime') else str(c) for c in cols]
     display_df.columns = str_cols
-    numeric_df.columns = str_cols
+    numeric_df_filled.columns = str_cols
     
-    # 5. Create a row-normalized gmap for the background gradient
-    def normalize_row(row):
-        mn, mx = row.min(), row.max()
-        if mx == mn:
-            return pd.Series(0.5, index=row.index)
-        return (row - mn) / (mx - mn)
+    gmap_df = pd.DataFrame(index=numeric_df_filled.index, columns=numeric_df_filled.columns, dtype=float)
+    
+    for r in gmap_df.index:
+        is_header_row = str(r).strip().endswith(':')
+        row_data = numeric_df_filled.loc[r]
+        
+        if is_header_row:
+            gmap_df.loc[r] = np.nan
+        else:
+            mn, mx = row_data.min(), row_data.max()
+            for c in gmap_df.columns:
+                display_val = str(display_df.at[r, c]).strip()
+                if display_val == "":
+                    gmap_df.at[r, c] = np.nan
+                else:
+                    gmap_df.at[r, c] = 0.5 if mx == mn else (row_data[c] - mn) / (mx - mn)
 
-    gmap_df = numeric_df.apply(normalize_row, axis=1)
+    # ---------------------------------------------------------
+    # THE FIX: Isolate the index and force the text alignment
+    # ---------------------------------------------------------
+    display_df = display_df.reset_index()
+    label_col = display_df.columns[0] 
+    gmap_df = gmap_df.reset_index(drop=True)
     
-    # 6. Styler function for injecting CSS text colors based on the text arrow
-    def apply_arrow_colors(data):
+    # 1. Function strictly for the label column
+    def style_labels(val):
+        if str(val).strip().endswith(':'):
+            return 'font-weight: 800 !important; text-align: right !important;'
+        return 'text-align: left !important;'
+
+    # 2. Function strictly for the data columns
+    def apply_data_styles(data):
         styles = pd.DataFrame('', index=data.index, columns=data.columns)
-        for c in data.columns:
-            for r in data.index:
-                val = str(data.at[r, c])
-                if "↑" in val:
-                    styles.at[r, c] = 'color: #00E676 !important;' # Bright Green
-                elif "↓" in val:
-                    styles.at[r, c] = 'color: #FF5252 !important;' # Bright Red
+        for r in data.index:
+            row_label = str(data.at[r, label_col]).strip()
+            is_header_row = row_label.endswith(':')
+            
+            for c in data.columns:
+                if c == label_col:
+                    continue # Handled by style_labels
+                    
+                val = str(data.at[r, c]).strip()
+                if is_header_row or val == "":
+                    styles.at[r, c] = 'background-color: transparent !important; background-image: none !important;'
+                else:
+                    css = ""
+                    if "↑" in val:
+                        css += 'color: #00E676 !important;' 
+                    elif "↓" in val:
+                        css += 'color: #FF5252 !important;' 
+                    styles.at[r, c] = css
         return styles
         
-    # 7. Apply full Pandas Styling Chain 
     styled_df = (
         display_df.style
         .set_properties(**{
-            'font-family': 'Roboto',
-            'background-color': '#0a0a0a', 
-            'color': '#888888',            
-            'border-color': '#333333',
-            'text-align': 'right'          
+            'font-family': '"Inter", "Segoe UI", system-ui, sans-serif',
+            'font-size': '14px',
+            'letter-spacing': '0.2px'       
         })
-        .apply(apply_arrow_colors, axis=None)
-        .background_gradient(axis=None, subset=str_cols, cmap='YlOrRd_r', gmap=gmap_df) 
+        # Hit the label column with the targeted bold/right-align
+        .map(style_labels, subset=[label_col]) 
+        # Hit the rest of the dataframe with colors/blanks
+        .apply(apply_data_styles, axis=None)
+        .background_gradient(axis=None, subset=str_cols, cmap='YlOrRd_r', gmap=gmap_df)
+        .hide(axis="index") 
     )
     
     return styled_df
-
 
 # ==========================================
 # 3. Sidebar Controls
@@ -177,7 +239,6 @@ if ticker_symbol:
         st.title(f"{company_name} ({ticker_symbol})")
         st.caption(f"**Sector:** {sector} | **Industry:** {industry} | **Currency:** {info.get('currency', 'USD')}")
         
-        # Business Summary Section
         with st.expander("View Full Business Operation Summary"):
             st.write(summary)
 
@@ -189,20 +250,11 @@ if ticker_symbol:
         m_col2.metric("Enterprise Value (EV)", f"${info.get('enterpriseValue', 0):,}")
         m_col3.metric("Trailing P/E Ratio", f"{info.get('trailingPE', 'N/A')}")
         
-        # Robust Dividend Yield Parser
         raw_yield = info.get('dividendYield')
-        
         if raw_yield is not None and raw_yield != 0:
-            # Contextual check: If a stable blue-chip like Visa returns a number > 0.1,
-            # or if the value is ridiculously high (> 100), it's already a pre-multiplied percentage.
-            # Otherwise, if it's a tiny fractional decimal (like 0.0082), it needs the 100x scale.
             is_pre_multiplied = False
-            
-            # If the ticker is a common stock and the yield is over 10.0 (1000% raw), or if it's 
-            # returned in the standard 0.5 - 5.0 range for normal yielding assets:
             if raw_yield > 0.2: 
                 is_pre_multiplied = True
-                
             display_yield = raw_yield if is_pre_multiplied else (raw_yield * 100)
             yield_str = f"{display_yield:.2f}%"
         else:
@@ -214,8 +266,6 @@ if ticker_symbol:
         # 5.5 Indexed Performance Comparison
         # ==========================================
         st.subheader("Relative Performance vs Benchmark")
-        
-        # Control row for the graph
         b_col1, b_col2, b_col3 = st.columns([1, 1, 2])
         with b_col1:
             benchmark_symbol = st.text_input("Benchmark Ticker", value="SPY").upper()
@@ -225,14 +275,11 @@ if ticker_symbol:
         if benchmark_symbol:
             with st.spinner(f"Compiling comparative price action against {benchmark_symbol}..."):
                 perf_df = get_indexed_performance(ticker_symbol, benchmark_symbol, timeframe)
-                
                 if not perf_df.empty:
-                    # Streamlit automatically assigns distinct colors and handles the legend
                     st.line_chart(perf_df, y_label="Cumulative Return (%)", use_container_width=True)
                 else:
-                    st.warning(f"Could not align historical data for {ticker_symbol} and {benchmark_symbol}. One of the assets may not have traded during this entire period.")
+                    st.warning(f"Could not align historical data for {ticker_symbol} and {benchmark_symbol}.")
 
-        
         # ==========================================
         # 6. Core Analytical Notebook Layout 
         # ==========================================
@@ -273,10 +320,9 @@ if ticker_symbol:
             }
             st.dataframe(pd.DataFrame(risk_data), use_container_width=True, hide_index=True)
 
-        st.subheader("Quarterly Accounting Statements")
-        st.write("Select and view all available quarterly statements below:")
+        st.subheader("Accounting Statements")
+        st.write("Select and view all available quarterly statements below (Sourced via SEC EDGAR):")
         
-        # Apply our new styling function before displaying
         if not financials.empty:
             st.markdown("**Income Statement**")
             st.dataframe(style_financial_statements(financials), use_container_width=True)
