@@ -22,6 +22,26 @@ def get_comprehensive_ticker_data(symbol):
         
     return info, financials, balance_sheet, cashflow
 
+@st.cache_data(ttl=3600)
+def get_indexed_performance(ticker_symbol, benchmark_symbol, period="1y"):
+    try:
+        # yf.download with multiple tickers returns a dataframe with tickers as columns
+        data = yf.download([ticker_symbol, benchmark_symbol], period=period)['Close']
+        
+        # Forward-fill to handle mismatched trading days (e.g., market halts), then drop early NaNs
+        data = data.ffill().dropna()
+        
+        if data.empty:
+            return pd.DataFrame()
+            
+        # Indexing Math: (Current Price / Starting Price - 1) * 100
+        indexed_data = (data / data.iloc[0] - 1) * 100
+        
+        return indexed_data
+    except Exception as e:
+        return pd.DataFrame()
+
+
 # ==========================================
 # 2. DataFrame Styling Helper Function
 # ==========================================
@@ -30,6 +50,13 @@ def style_financial_statements(df):
     if df is None or df.empty:
         return df
         
+    # --- Drop columns that are completely empty (all NaNs) BEFORE formatting ---
+    df = df.dropna(axis=1, how='all')
+    
+    # Safeguard: If dropping empty columns leaves us with nothing, return early
+    if df.empty:
+        return df
+    
     # 1. Ensure columns are sorted newest to oldest (Standard yfinance output)
     cols = sorted(df.columns, reverse=True)
     
@@ -39,7 +66,7 @@ def style_financial_statements(df):
     # Cast display_df to 'object' so Pandas allows us to inject strings (arrows, %, N/A)
     display_df = df[cols].copy().astype(object)
     
-    # --- NEW: Strict Accounting Formatter ---
+    # --- Strict Accounting Formatter ---
     def to_accounting(val):
         if pd.isna(val):
             return "N/A"
@@ -119,13 +146,14 @@ def style_financial_statements(df):
             'background-color': '#0a0a0a', 
             'color': '#888888',            
             'border-color': '#333333',
-            'text-align': 'right'          # <--- NEW: Forces strict right-alignment
+            'text-align': 'right'          
         })
         .apply(apply_arrow_colors, axis=None)
         .background_gradient(axis=None, subset=str_cols, cmap='YlOrRd_r', gmap=gmap_df) 
     )
     
     return styled_df
+
 
 # ==========================================
 # 3. Sidebar Controls
@@ -160,12 +188,55 @@ if ticker_symbol:
         m_col1.metric("Market Capitalization", f"${info.get('marketCap', 0):,}")
         m_col2.metric("Enterprise Value (EV)", f"${info.get('enterpriseValue', 0):,}")
         m_col3.metric("Trailing P/E Ratio", f"{info.get('trailingPE', 'N/A')}")
-        m_col4.metric("Dividend Yield", f"{info.get('dividendYield', 0) * 100:.2f}%" if info.get('dividendYield') else "0.00%")
+        
+        # Robust Dividend Yield Parser
+        raw_yield = info.get('dividendYield')
+        
+        if raw_yield is not None and raw_yield != 0:
+            # Contextual check: If a stable blue-chip like Visa returns a number > 0.1,
+            # or if the value is ridiculously high (> 100), it's already a pre-multiplied percentage.
+            # Otherwise, if it's a tiny fractional decimal (like 0.0082), it needs the 100x scale.
+            is_pre_multiplied = False
+            
+            # If the ticker is a common stock and the yield is over 10.0 (1000% raw), or if it's 
+            # returned in the standard 0.5 - 5.0 range for normal yielding assets:
+            if raw_yield > 0.2: 
+                is_pre_multiplied = True
+                
+            display_yield = raw_yield if is_pre_multiplied else (raw_yield * 100)
+            yield_str = f"{display_yield:.2f}%"
+        else:
+            yield_str = "0.00%"
+            
+        m_col4.metric("Dividend Yield", yield_str)
+        
+        # ==========================================
+        # 5.5 Indexed Performance Comparison
+        # ==========================================
+        st.subheader("Relative Performance vs Benchmark")
+        
+        # Control row for the graph
+        b_col1, b_col2, b_col3 = st.columns([1, 1, 2])
+        with b_col1:
+            benchmark_symbol = st.text_input("Benchmark Ticker", value="SPY").upper()
+        with b_col2:
+            timeframe = st.selectbox("Timeframe", options=["1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "ytd"], index=3)
+            
+        if benchmark_symbol:
+            with st.spinner(f"Compiling comparative price action against {benchmark_symbol}..."):
+                perf_df = get_indexed_performance(ticker_symbol, benchmark_symbol, timeframe)
+                
+                if not perf_df.empty:
+                    # Streamlit automatically assigns distinct colors and handles the legend
+                    st.line_chart(perf_df, y_label="Cumulative Return (%)", use_container_width=True)
+                else:
+                    st.warning(f"Could not align historical data for {ticker_symbol} and {benchmark_symbol}. One of the assets may not have traded during this entire period.")
+
         
         # ==========================================
         # 6. Core Analytical Notebook Layout 
         # ==========================================
-        st.subheader("🔍 Relative Valuation Multiples")
+        st.subheader("Relative Valuation Multiples")
         val_data = {
             "Multiple": ["Trailing P/E", "Forward P/E", "PEG Ratio (5yr expected)", "Price to Sales (TTM)", "Price to Book", "EV / Revenue", "EV / EBITDA"],
             "Value": [info.get('trailingPE'), info.get('forwardPE'), info.get('pegRatio'), info.get('priceToSalesTrailing12Months'), info.get('priceToBook'), info.get('enterpriseToRevenue'), info.get('enterpriseToEbitda')]
